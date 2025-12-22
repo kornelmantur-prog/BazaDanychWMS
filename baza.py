@@ -14,7 +14,7 @@ try:
     key = st.secrets["supabase"]["key"]
     supabase: Client = create_client(url, key)
 except Exception as e:
-    st.error("🔴 Błąd połączenia z bazą danych. Upewnij się, że skonfigurowałeś secrets.toml.")
+    st.error("🔴 Błąd połączenia z bazą danych. Sprawdź plik secrets.toml.")
     st.info("Szczegóły błędu: " + str(e))
     st.stop()
 
@@ -22,23 +22,33 @@ except Exception as e:
 
 def pobierz_dane():
     """Pobiera produkty i kategorie, zwraca DataFrame i surowe dane."""
-    # Pobieramy produkty z relacją do kategorii
-    response = supabase.table('Produkt').select("*, kategorie(nazwa)").execute()
-    data = response.data
-    
-    cleaned_data = []
-    for item in data:
-        kat_nazwa = item['kategorie']['nazwa'] if item['kategorie'] else "Brak"
-        cleaned_data.append({
-            "ID": item['id'],
-            "Nazwa": item['nazwa'],
-            "Ilość": item['liczba'],     # To jest nasza ilość sztuk
-            "Cena": item['cena'],
-            "Kategoria": kat_nazwa,
-            "Kategoria_ID": item['Kategoria_ID']
-        })
-    
-    return pd.DataFrame(cleaned_data), cleaned_data
+    try:
+        # Pobieramy produkty z relacją do kategorii
+        # UWAGA: Supabase/Postgres często zmienia nazwy kolumn na małe litery
+        response = supabase.table('Produkt').select("*, kategorie(nazwa)").execute()
+        data = response.data
+        
+        cleaned_data = []
+        for item in data:
+            # Bezpieczne pobieranie nazwy kategorii (jeśli brak, wpisz "Brak")
+            kat_nazwa = item.get('kategorie', {}).get('nazwa') if item.get('kategorie') else "Brak"
+            
+            # Bezpieczne pobieranie ID kategorii (sprawdza Kategoria_ID oraz kategoria_ID)
+            kat_id_safe = item.get('Kategoria_ID', item.get('kategoria_ID'))
+            
+            cleaned_data.append({
+                "ID": item['id'],
+                "Nazwa": item['nazwa'],
+                "Ilość": item['liczba'],
+                "Cena": item['cena'],
+                "Kategoria": kat_nazwa,
+                "Kategoria_ID": kat_id_safe 
+            })
+        
+        return pd.DataFrame(cleaned_data), cleaned_data
+    except Exception as e:
+        st.error(f"Błąd podczas pobierania danych: {e}")
+        return pd.DataFrame(), []
 
 def pobierz_liste_kategorii():
     res = supabase.table('kategorie').select("*").execute()
@@ -46,6 +56,7 @@ def pobierz_liste_kategorii():
 
 def dodaj_produkt_db(nazwa, liczba, cena, kat_id):
     try:
+        # Tutaj używamy klucza 'kategoria_ID' (z małej litery), bo tak zazwyczaj oczekuje Supabase
         data = {
             "nazwa": nazwa,
             "liczba": int(liczba),
@@ -55,7 +66,7 @@ def dodaj_produkt_db(nazwa, liczba, cena, kat_id):
         supabase.table('Produkt').insert(data).execute()
         return True
     except Exception as e:
-        st.error(f"Błąd zapisu: {e}")
+        st.error(f"Błąd zapisu produktu: {e}")
         return False
 
 def aktualizuj_stan_db(prod_id, nowa_ilosc):
@@ -64,7 +75,7 @@ def aktualizuj_stan_db(prod_id, nowa_ilosc):
         supabase.table('Produkt').update({"liczba": int(nowa_ilosc)}).eq("id", prod_id).execute()
         return True
     except Exception as e:
-        st.error(f"Błąd aktualizacji: {e}")
+        st.error(f"Błąd aktualizacji stanu: {e}")
         return False
 
 def usun_produkt_db(prod_id):
@@ -73,7 +84,7 @@ def usun_produkt_db(prod_id):
         supabase.table('Produkt').delete().eq("id", prod_id).execute()
         return True
     except Exception as e:
-        st.error(f"Błąd usuwania: {e}")
+        st.error(f"Błąd usuwania produktu: {e}")
         return False
 
 def dodaj_kategorie_db(nazwa, opis):
@@ -97,8 +108,8 @@ suma_sztuk = 0
 wartosc_magazynu = 0
 liczba_pozycji = 0
 
-if not df.empty:
-    suma_sztuk = df["Ilość"].sum()  # Suma wszystkich sztuk
+if not df.empty and "Ilość" in df.columns:
+    suma_sztuk = df["Ilość"].sum()
     wartosc_magazynu = sum(df["Ilość"] * df["Cena"])
     liczba_pozycji = len(df)
 
@@ -120,19 +131,19 @@ tab_view, tab_add, tab_edit, tab_cat = st.tabs([
 with tab_view:
     st.subheader("Aktualny inwentarz")
     if not df.empty:
-        # Wyświetlamy tabelę z formatowaniem
         st.dataframe(
             df,
             column_config={
                 "Cena": st.column_config.NumberColumn(format="%.2f zł"),
                 "Ilość": st.column_config.NumberColumn(format="%d szt."),
-                "ID": st.column_config.NumberColumn(format="%d")
+                "ID": st.column_config.NumberColumn(format="%d"),
+                "Kategoria_ID": None # Ukrywamy ID kategorii w tabeli, bo mamy nazwę
             },
             use_container_width=True,
             hide_index=True
         )
     else:
-        st.info("Magazyn jest pusty. Dodaj produkty w zakładce 'Przyjęcie Towaru'.")
+        st.info("Brak danych lub magazyn jest pusty.")
     
     if st.button("🔄 Odśwież dane"):
         st.rerun()
@@ -143,7 +154,7 @@ with tab_add:
     
     cats = pobierz_liste_kategorii()
     if not cats:
-        st.warning("Brak kategorii! Dodaj je najpierw w zakładce 'Zarządzaj Kategoriami'.")
+        st.warning("⚠️ Brak kategorii! Dodaj je najpierw w zakładce 'Zarządzaj Kategoriami'.")
     else:
         mapa_kat = {c['nazwa']: c['id'] for c in cats}
         
@@ -175,54 +186,63 @@ with tab_edit:
     if df.empty:
         st.info("Brak produktów do edycji.")
     else:
-        # Wybór produktu do operacji
-        # Tworzymy listę etykiet np. "Młotek (Stan: 50 szt.)"
-        opcje_prod = {f"{p['Nazwa']} (ID: {p['ID']} | Stan: {p['Ilość']})": p for p in raw_data}
-        wybrany_klucz = st.selectbox("Wybierz produkt:", list(opcje_prod.keys()))
-        
-        wybrany_produkt = opcje_prod[wybrany_klucz]
-        current_id = wybrany_produkt['ID']
-        current_ilosc = wybrany_produkt['Ilość']
-        current_nazwa = wybrany_produkt['Nazwa']
-        
-        st.markdown(f"**Wybrano:** {current_nazwa} | **Aktualny stan:** {current_ilosc} szt.")
-        
-        st.write("---")
-        
-        # Dwie kolumny: Jedna do zmiany ilości, druga do usuwania
-        col_edit, col_del = st.columns([2, 1])
-        
-        # Opcja A: Zmiana Ilości (Wydanie/Przyjęcie korekcyjne)
-        with col_edit:
-            st.markdown("#### 📉 Wydanie / Aktualizacja stanu")
-            nowa_ilosc_input = st.number_input(
-                "Ustaw nową ilość na magazynie", 
-                min_value=0, 
-                value=current_ilosc,
-                step=1,
-                help="Wpisz ile sztuk fizycznie znajduje się teraz na magazynie."
-            )
+        # Tworzymy listę do selectboxa
+        opcje_prod = {}
+        for p in raw_data:
+            # Zabezpieczenie na wypadek braku kluczy
+            pid = p.get('ID')
+            pnazwa = p.get('Nazwa')
+            pilosc = p.get('Ilość')
+            if pid is not None:
+                label = f"{pnazwa} (ID: {pid} | Stan: {pilosc})"
+                opcje_prod[label] = p
+
+        if opcje_prod:
+            wybrany_klucz = st.selectbox("Wybierz produkt:", list(opcje_prod.keys()))
+            wybrany_produkt = opcje_prod[wybrany_klucz]
             
-            if st.button("Zatwierdź nową ilość"):
-                if nowa_ilosc_input != current_ilosc:
-                    ok = aktualizuj_stan_db(current_id, nowa_ilosc_input)
+            current_id = wybrany_produkt['ID']
+            current_ilosc = wybrany_produkt['Ilość']
+            current_nazwa = wybrany_produkt['Nazwa']
+            
+            st.markdown(f"**Wybrano:** {current_nazwa} | **Aktualny stan:** {current_ilosc} szt.")
+            st.write("---")
+            
+            col_edit, col_del = st.columns([2, 1])
+            
+            # Opcja A: Zmiana Ilości
+            with col_edit:
+                st.markdown("#### 📉 Wydanie / Aktualizacja stanu")
+                nowa_ilosc_input = st.number_input(
+                    "Nowy stan magazynowy", 
+                    min_value=0, 
+                    value=int(current_ilosc),
+                    step=1,
+                    key="edit_qty"
+                )
+                
+                if st.button("Zatwierdź nową ilość"):
+                    if nowa_ilosc_input != current_ilosc:
+                        ok = aktualizuj_stan_db(current_id, nowa_ilosc_input)
+                        if ok:
+                            st.success(f"Zaktualizowano stan {current_nazwa}.")
+                            time.sleep(1)
+                            st.rerun()
+                    else:
+                        st.warning("Ilość jest taka sama.")
+
+            # Opcja B: Usuwanie
+            with col_del:
+                st.markdown("#### ❌ Usuń produkt")
+                st.warning("Operacja nieodwracalna.")
+                if st.button("Usuń z bazy"):
+                    ok = usun_produkt_db(current_id)
                     if ok:
-                        st.success(f"Zaktualizowano stan {current_nazwa} na {nowa_ilosc_input} szt.")
+                        st.success(f"Usunięto {current_nazwa}.")
                         time.sleep(1)
                         st.rerun()
-                else:
-                    st.warning("Ilość nie została zmieniona.")
-
-        # Opcja B: Usuwanie Całkowite
-        with col_del:
-            st.markdown("#### ❌ Usuń produkt")
-            st.warning("Tej operacji nie można cofnąć.")
-            if st.button("Usuń całkowicie z bazy"):
-                ok = usun_produkt_db(current_id)
-                if ok:
-                    st.success(f"Produkt {current_nazwa} usunięty.")
-                    time.sleep(1)
-                    st.rerun()
+        else:
+             st.warning("Coś poszło nie tak z listą produktów. Odśwież stronę.")
 
 # --- ZAKŁADKA 4: KATEGORIE ---
 with tab_cat:
@@ -240,8 +260,7 @@ with tab_cat:
                 time.sleep(0.5)
                 st.rerun()
     
-    # Wyświetlenie listy kategorii
     cats_list = pobierz_liste_kategorii()
     if cats_list:
         st.write("Dostępne kategorie:")
-        st.dataframe(pd.DataFrame(cats_list)[['nazwa', 'opis']], hide_index=True)
+        st.dataframe(pd.DataFrame(cats_list), hide_index=True)
