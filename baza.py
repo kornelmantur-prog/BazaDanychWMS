@@ -4,9 +4,7 @@ import pandas as pd
 import time
 
 # --- 1. KONFIGURACJA STRONY ---
-# Usunięto niestandardowe ikony i kolory. Ustawiono domyślny, czysty styl.
-st.set_page_config(page_title="System WMS", layout="wide")
-
+st.set_page_config(page_title="System WMS Pro", layout="wide")
 st.title("System WMS - Zarządzanie Magazynem")
 
 # --- 2. POŁĄCZENIE Z BAZĄ DANYCH ---
@@ -18,8 +16,29 @@ except Exception as e:
     st.error("Błąd połączenia z bazą danych. Sprawdź plik secrets.toml.")
     st.stop()
 
-# --- 3. FUNKCJE BAZY DANYCH (CRUD) ---
+# --- 3. FUNKCJE LOGIKI I BAZY DANYCH ---
 
+# -- LOGI I HISTORIA --
+def zapisz_historie(prod_nazwa, operacja, ilosc):
+    """Zapisuje zdarzenie w historii operacji."""
+    try:
+        supabase.table('historia_operacji').insert({
+            "produkt_nazwa": prod_nazwa,
+            "typ_operacji": operacja,
+            "ilosc_zmiana": int(ilosc)
+        }).execute()
+    except Exception as e:
+        print(f"Błąd logowania historii: {e}") # Tylko w konsoli, nie przerywa działania
+
+def pobierz_historie():
+    try:
+        # Pobieramy ostatnie 100 wpisów, sortując od najnowszych
+        res = supabase.table('historia_operacji').select("*").order("created_at", desc=True).limit(100).execute()
+        return pd.DataFrame(res.data)
+    except Exception as e:
+        return pd.DataFrame()
+
+# -- POBIERANIE DANYCH --
 def pobierz_dane():
     try:
         response = supabase.table('Produkt').select("*, kategorie(nazwa)").execute()
@@ -27,7 +46,6 @@ def pobierz_dane():
         cleaned_data = []
         for item in data:
             kat_nazwa = item.get('kategorie', {}).get('nazwa') if item.get('kategorie') else "Brak"
-            # Obsługa różnych wielkości liter w kluczach
             kat_id_safe = item.get('Kategoria_ID', item.get('kategoria_ID'))
             
             cleaned_data.append({
@@ -47,44 +65,48 @@ def pobierz_liste_kategorii():
     res = supabase.table('kategorie').select("*").order('id').execute()
     return res.data
 
-# --- PRODUKTY ---
+# -- OPERACJE NA PRODUKTACH --
 def dodaj_produkt_db(nazwa, liczba, cena, kat_id):
     try:
         data = {"nazwa": nazwa, "liczba": int(liczba), "cena": float(cena), "kategoria_ID": int(kat_id)}
         supabase.table('Produkt').insert(data).execute()
+        zapisz_historie(nazwa, "Przyjęcie nowego towaru", liczba)
         return True
     except Exception as e:
         st.error(f"Błąd: {e}")
         return False
 
-def aktualizuj_stan_db(prod_id, nowa_ilosc):
-    """Służy do szybkiej aktualizacji ilości (np. przy wysyłce)."""
+def aktualizuj_stan_db(prod_id, prod_nazwa, nowa_ilosc, stara_ilosc, typ_operacji="Korekta"):
+    """Aktualizuje ilość i loguje zmianę (różnicę)."""
     try:
+        roznica = nowa_ilosc - stara_ilosc
         supabase.table('Produkt').update({"liczba": int(nowa_ilosc)}).eq("id", prod_id).execute()
+        zapisz_historie(prod_nazwa, typ_operacji, roznica)
         return True
     except Exception as e:
         st.error(f"Błąd aktualizacji stanu: {e}")
         return False
 
-def edytuj_produkt_calosc(prod_id, nazwa, liczba, cena, kat_id):
-    """Edytuje wszystkie pola produktu."""
+def edytuj_produkt_calosc(prod_id, stara_nazwa, nowa_nazwa, liczba, cena, kat_id):
     try:
-        data = {"nazwa": nazwa, "liczba": int(liczba), "cena": float(cena), "kategoria_ID": int(kat_id)}
+        data = {"nazwa": nowa_nazwa, "liczba": int(liczba), "cena": float(cena), "kategoria_ID": int(kat_id)}
         supabase.table('Produkt').update(data).eq("id", prod_id).execute()
+        zapisz_historie(nowa_nazwa, "Edycja danych/stanu", liczba) # Logujemy aktualny stan
         return True
     except Exception as e:
         st.error(f"Błąd edycji: {e}")
         return False
 
-def usun_produkt_db(prod_id):
+def usun_produkt_db(prod_id, prod_nazwa):
     try:
         supabase.table('Produkt').delete().eq("id", prod_id).execute()
+        zapisz_historie(prod_nazwa, "Usunięcie produktu", 0)
         return True
     except Exception as e:
         st.error(f"Błąd usuwania: {e}")
         return False
 
-# --- KATEGORIE ---
+# -- KATEGORIE --
 def dodaj_kategorie_db(nazwa, opis):
     try:
         supabase.table('kategorie').insert({"nazwa": nazwa, "opis": opis}).execute()
@@ -114,27 +136,60 @@ def usun_kategorie_db(cat_id):
 df, raw_data = pobierz_dane()
 cats_list = pobierz_liste_kategorii()
 
-# Mapowania pomocnicze
 mapa_kat_id_nazwa = {c['id']: c['nazwa'] for c in cats_list} if cats_list else {}
 mapa_kat_nazwa_id = {c['nazwa']: c['id'] for c in cats_list} if cats_list else {}
 
-# --- PODSUMOWANIE (STATYSTYKI) ---
-st.markdown("### Status Magazynu")
+# --- DASHBOARD / STATYSTYKI ---
+st.header("Panel Zarządzania")
+
+# 1. Alerty niskiego stanu
+if not df.empty:
+    low_stock = df[df["Ilość"] < 5] # Próg alarmowy: 5 sztuk
+    if not low_stock.empty:
+        st.error(f"⚠️ Uwaga! {len(low_stock)} produktów ma niski stan magazynowy (poniżej 5 szt.)")
+        st.dataframe(low_stock[["Nazwa", "Ilość", "Kategoria"]], hide_index=True)
+    else:
+        st.success("Wszystkie stany magazynowe są na bezpiecznym poziomie.")
+
+st.divider()
+
+# 2. Metryki i Wykresy
 col1, col2, col3 = st.columns(3)
 if not df.empty:
     col1.metric("Wszystkie sztuki", f"{df['Ilość'].sum()} szt.")
-    col2.metric("Wartość", f"{sum(df['Ilość'] * df['Cena']):.2f} PLN")
-    col3.metric("Rodzaje produktów", f"{len(df)}")
+    col2.metric("Wartość Magazynu", f"{sum(df['Ilość'] * df['Cena']):.2f} PLN")
+    col3.metric("Ilość Produktów", f"{len(df)}")
+    
+    st.write("---")
+    
+    # Wykresy analityczne
+    chart_col1, chart_col2 = st.columns(2)
+    
+    with chart_col1:
+        st.subheader("Ilość sztuk w kategoriach")
+        # Grupujemy dane, aby zobaczyć ile sztuk jest w każdej kategorii
+        bar_data = df.groupby("Kategoria")["Ilość"].sum()
+        st.bar_chart(bar_data)
+        
+    with chart_col2:
+        st.subheader("Wartość kategorii (PLN)")
+        # Obliczamy wartość dla każdego produktu, a potem grupujemy
+        df["Wartość Pozycji"] = df["Ilość"] * df["Cena"]
+        value_data = df.groupby("Kategoria")["Wartość Pozycji"].sum()
+        st.bar_chart(value_data)
+else:
+    st.info("Dodaj produkty, aby zobaczyć statystyki.")
+
 st.divider()
 
-# --- ZAKŁADKI ---
-# Teraz czyste nazwy bez emotek
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# --- ZAKŁADKI GŁÓWNE ---
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Stan Magazynowy", 
     "Dodaj Produkt", 
     "Wysyłka", 
     "Edycja Produktu", 
-    "Kategorie"
+    "Kategorie",
+    "Historia Operacji"
 ])
 
 # 1. LISTA
@@ -142,19 +197,15 @@ with tab1:
     st.subheader("Lista Produktów")
     if not df.empty:
         st.dataframe(
-            df, 
+            df[["Nazwa", "Ilość", "Cena", "Kategoria", "ID"]], 
             column_config={
                 "Cena": st.column_config.NumberColumn(format="%.2f zł"),
                 "Ilość": st.column_config.NumberColumn(format="%d szt."),
-                "Kategoria_ID": None
             }, 
             use_container_width=True, 
             hide_index=True
         )
-    else:
-        st.info("Magazyn jest pusty.")
-    
-    if st.button("Odśwież tabelę"):
+    if st.button("Odśwież dane"):
         st.rerun()
 
 # 2. DODAJ PRODUKT
@@ -176,41 +227,35 @@ with tab2:
                     time.sleep(1)
                     st.rerun()
 
-# 3. WYSYŁKA (NOWA FUNKCJA)
+# 3. WYSYŁKA
 with tab3:
     st.subheader("Wysyłka towaru")
-    
     if df.empty:
-        st.info("Brak produktów do wysyłki.")
+        st.info("Brak produktów.")
     else:
-        # Wybór produktu
         opcje = {f"{p['Nazwa']} (Dostępne: {p['Ilość']} szt.)": p for p in raw_data}
         wybor = st.selectbox("Wybierz produkt do wysłania", list(opcje.keys()))
         prod = opcje[wybor]
-        
         dostepne = int(prod['Ilość'])
         
         with st.form("shipping_form"):
-            st.write(f"Produkt: **{prod['Nazwa']}**")
-            st.write(f"Stan magazynowy: {dostepne} szt.")
-            
+            st.write(f"Wybrano: **{prod['Nazwa']}**")
             ilosc_do_wyslania = st.number_input("Ile sztuk wysłać?", min_value=1, step=1)
             
-            submit_ship = st.form_submit_button("Zatwierdź wysyłkę")
-            
-            if submit_ship:
+            if st.form_submit_button("Zatwierdź wysyłkę"):
                 if ilosc_do_wyslania > dostepne:
-                    st.error(f"Błąd: Nie masz tyle towaru! Dostępne tylko {dostepne} szt.")
+                    st.error(f"Błąd: Nie masz tyle towaru! Dostępne: {dostepne}.")
                 else:
                     nowy_stan = dostepne - ilosc_do_wyslania
-                    if aktualizuj_stan_db(prod['ID'], nowy_stan):
-                        st.success(f"Wysłano {ilosc_do_wyslania} szt. produktu {prod['Nazwa']}. Nowy stan: {nowy_stan}.")
-                        time.sleep(1.5)
+                    # Przekazujemy starą ilość, by wyliczyć różnicę do historii
+                    if aktualizuj_stan_db(prod['ID'], prod['Nazwa'], nowy_stan, dostepne, "Wydanie"):
+                        st.success(f"Wysłano {ilosc_do_wyslania} szt. Zaktualizowano stan.")
+                        time.sleep(1)
                         st.rerun()
 
-# 4. EDYCJA / USUWANIE
+# 4. EDYCJA
 with tab4:
-    st.subheader("Edycja danych produktu")
+    st.subheader("Edycja danych")
     if not df.empty:
         opcje_edit = {f"{p['Nazwa']} (ID:{p['ID']})": p for p in raw_data}
         wybor_edit = st.selectbox("Wybierz produkt do edycji", list(opcje_edit.keys()), key="edit_select")
@@ -218,10 +263,8 @@ with tab4:
         
         with st.form("edit_prod_form"):
             col_e1, col_e2 = st.columns(2)
-            
             e_nazwa = col_e1.text_input("Nazwa", value=prod_edit['Nazwa'])
             
-            # Ustawienie domyślnej kategorii
             domyslny_index = 0
             if prod_edit['Kategoria_ID'] in mapa_kat_id_nazwa:
                 biezaca_nazwa = mapa_kat_id_nazwa[prod_edit['Kategoria_ID']]
@@ -229,78 +272,74 @@ with tab4:
                     domyslny_index = list(mapa_kat_nazwa_id.keys()).index(biezaca_nazwa)
             
             e_kat_nazwa = col_e1.selectbox("Kategoria", list(mapa_kat_nazwa_id.keys()), index=domyslny_index)
-            
-            # Tutaj można zrobić korektę stanu (np. inwentaryzacja)
-            e_ilosc = col_e2.number_input("Ilość (Korekta stanu)", min_value=0, value=int(prod_edit['Ilość']))
+            e_ilosc = col_e2.number_input("Ilość (Korekta)", min_value=0, value=int(prod_edit['Ilość']))
             e_cena = col_e2.number_input("Cena (PLN)", min_value=0.01, value=float(prod_edit['Cena']))
             
-            zapisz = st.form_submit_button("Zapisz zmiany")
-            
-            if zapisz:
+            if st.form_submit_button("Zapisz zmiany"):
                 nowe_kat_id = mapa_kat_nazwa_id[e_kat_nazwa]
-                if edytuj_produkt_calosc(prod_edit['ID'], e_nazwa, e_ilosc, e_cena, nowe_kat_id):
-                    st.success("Dane produktu zaktualizowane.")
+                # Przekazujemy starą nazwę do celów logowania
+                if edytuj_produkt_calosc(prod_edit['ID'], prod_edit['Nazwa'], e_nazwa, e_ilosc, e_cena, nowe_kat_id):
+                    st.success("Zapisano zmiany.")
                     time.sleep(1)
                     st.rerun()
         
-        st.divider()
-        st.write("Usuwanie produktu")
+        st.write("---")
         col_del, _ = st.columns([1, 4])
         if col_del.button("Usuń trwale ten produkt"):
-            if usun_produkt_db(prod_edit['ID']):
-                st.success("Produkt usunięty z bazy.")
+            if usun_produkt_db(prod_edit['ID'], prod_edit['Nazwa']):
+                st.success("Produkt usunięty.")
                 time.sleep(1)
                 st.rerun()
-    else:
-        st.info("Brak produktów.")
 
 # 5. KATEGORIE
 with tab5:
-    st.subheader("Zarządzanie Kategoriami")
+    st.subheader("Kategorie")
+    col_add, col_list = st.columns(2)
     
-    col_add_cat, col_edit_cat = st.columns(2)
-    
-    # A. Dodawanie
-    with col_add_cat:
-        st.write("Dodaj nową kategorię")
+    with col_add:
         with st.form("add_cat"):
             cn = st.text_input("Nazwa kategorii")
-            co = st.text_input("Opis (opcjonalnie)")
+            co = st.text_input("Opis")
             if st.form_submit_button("Dodaj"):
                 if cn:
                     dodaj_kategorie_db(cn, co)
-                    st.success("Kategoria dodana.")
+                    st.success("Dodano.")
                     time.sleep(0.5)
                     st.rerun()
-                else:
-                    st.error("Nazwa jest wymagana.")
     
-    # B. Edycja / Usuwanie
-    with col_edit_cat:
-        st.write("Edytuj lub usuń kategorię")
+    with col_list:
         if cats_list:
-            opcje_kat = {c['nazwa']: c for c in cats_list}
-            wybor_kat = st.selectbox("Wybierz kategorię", list(opcje_kat.keys()))
-            obj_kat = opcje_kat[wybor_kat]
+            st.dataframe(pd.DataFrame(cats_list)[['nazwa', 'opis']], hide_index=True)
             
-            with st.form("edit_cat_form"):
-                ec_nazwa = st.text_input("Edytuj nazwę", value=obj_kat['nazwa'])
-                ec_opis = st.text_input("Edytuj opis", value=obj_kat['opis'] if obj_kat['opis'] else "")
-                
-                c_btn1, c_btn2 = st.columns(2)
-                edycja = c_btn1.form_submit_button("Zapisz zmiany")
-                usuniecie = c_btn2.form_submit_button("Usuń Kategorię")
-                
-                if edycja:
-                    if edytuj_kategorie_db(obj_kat['id'], ec_nazwa, ec_opis):
-                        st.success("Zaktualizowano kategorię.")
-                        time.sleep(1)
-                        st.rerun()
-                
-                if usuniecie:
-                    if usun_kategorie_db(obj_kat['id']):
-                        st.success("Usunięto kategorię.")
-                        time.sleep(1)
-                        st.rerun()
-        else:
-            st.info("Brak kategorii.")
+            # Prosta edycja kategorii
+            st.write("Usuń kategorię:")
+            k_to_del = st.selectbox("Wybierz do usunięcia", [c['nazwa'] for c in cats_list], key="del_cat_sel")
+            id_to_del = mapa_kat_nazwa_id[k_to_del]
+            if st.button("Usuń wybraną kategorię"):
+                if usun_kategorie_db(id_to_del):
+                    st.success("Usunięto.")
+                    time.sleep(1)
+                    st.rerun()
+
+# 6. HISTORIA (NOWA ZAKŁADKA)
+with tab6:
+    st.subheader("📜 Historia Operacji")
+    df_hist = pobierz_historie()
+    
+    if not df_hist.empty:
+        # Formatowanie daty dla czytelności
+        df_hist['created_at'] = pd.to_datetime(df_hist['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+        
+        st.dataframe(
+            df_hist[['created_at', 'produkt_nazwa', 'typ_operacji', 'ilosc_zmiana']],
+            column_config={
+                "created_at": "Data i Czas",
+                "produkt_nazwa": "Produkt",
+                "typ_operacji": "Operacja",
+                "ilosc_zmiana": "Zmiana ilości"
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Brak historii operacji.")
