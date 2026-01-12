@@ -1,6 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+import plotly.express as px
 import time
 
 # --- 1. KONFIGURACJA STRONY ---
@@ -20,7 +21,6 @@ except Exception as e:
 
 # -- LOGI I HISTORIA --
 def zapisz_historie(prod_nazwa, operacja, ilosc):
-    """Zapisuje zdarzenie w historii operacji."""
     try:
         supabase.table('historia_operacji').insert({
             "produkt_nazwa": prod_nazwa,
@@ -28,11 +28,10 @@ def zapisz_historie(prod_nazwa, operacja, ilosc):
             "ilosc_zmiana": int(ilosc)
         }).execute()
     except Exception as e:
-        print(f"Błąd logowania historii: {e}") # Tylko w konsoli, nie przerywa działania
+        print(f"Błąd logowania: {e}")
 
 def pobierz_historie():
     try:
-        # Pobieramy ostatnie 100 wpisów, sortując od najnowszych
         res = supabase.table('historia_operacji').select("*").order("created_at", desc=True).limit(100).execute()
         return pd.DataFrame(res.data)
     except Exception as e:
@@ -70,14 +69,13 @@ def dodaj_produkt_db(nazwa, liczba, cena, kat_id):
     try:
         data = {"nazwa": nazwa, "liczba": int(liczba), "cena": float(cena), "kategoria_ID": int(kat_id)}
         supabase.table('Produkt').insert(data).execute()
-        zapisz_historie(nazwa, "Przyjęcie nowego towaru", liczba)
+        zapisz_historie(nazwa, "Nowy Produkt", liczba)
         return True
     except Exception as e:
         st.error(f"Błąd: {e}")
         return False
 
 def aktualizuj_stan_db(prod_id, prod_nazwa, nowa_ilosc, stara_ilosc, typ_operacji="Korekta"):
-    """Aktualizuje ilość i loguje zmianę (różnicę)."""
     try:
         roznica = nowa_ilosc - stara_ilosc
         supabase.table('Produkt').update({"liczba": int(nowa_ilosc)}).eq("id", prod_id).execute()
@@ -91,7 +89,7 @@ def edytuj_produkt_calosc(prod_id, stara_nazwa, nowa_nazwa, liczba, cena, kat_id
     try:
         data = {"nazwa": nowa_nazwa, "liczba": int(liczba), "cena": float(cena), "kategoria_ID": int(kat_id)}
         supabase.table('Produkt').update(data).eq("id", prod_id).execute()
-        zapisz_historie(nowa_nazwa, "Edycja danych/stanu", liczba) # Logujemy aktualny stan
+        zapisz_historie(nowa_nazwa, "Edycja danych/stanu", liczba)
         return True
     except Exception as e:
         st.error(f"Błąd edycji: {e}")
@@ -142,14 +140,13 @@ mapa_kat_nazwa_id = {c['nazwa']: c['id'] for c in cats_list} if cats_list else {
 # --- DASHBOARD / STATYSTYKI ---
 st.header("Panel Zarządzania")
 
-# 1. Alerty niskiego stanu
+# 1. Alerty
 if not df.empty:
-    low_stock = df[df["Ilość"] < 5] # Próg alarmowy: 5 sztuk
+    low_stock = df[df["Ilość"] < 5]
     if not low_stock.empty:
-        st.error(f"⚠️ Uwaga! {len(low_stock)} produktów ma niski stan magazynowy (poniżej 5 szt.)")
-        st.dataframe(low_stock[["Nazwa", "Ilość", "Kategoria"]], hide_index=True)
+        st.error(f"⚠️ Uwaga! {len(low_stock)} produktów ma niski stan (poniżej 5 szt.)")
     else:
-        st.success("Wszystkie stany magazynowe są na bezpiecznym poziomie.")
+        st.success("Stany magazynowe w normie.")
 
 st.divider()
 
@@ -162,30 +159,34 @@ if not df.empty:
     
     st.write("---")
     
-    # Wykresy analityczne
+    # --- WYKRESY KOŁOWE ---
     chart_col1, chart_col2 = st.columns(2)
     
     with chart_col1:
-        st.subheader("Ilość sztuk w kategoriach")
-        # Grupujemy dane, aby zobaczyć ile sztuk jest w każdej kategorii
-        bar_data = df.groupby("Kategoria")["Ilość"].sum()
-        st.bar_chart(bar_data)
+        st.subheader("Struktura Ilości (Sztuki)")
+        qty_by_cat = df.groupby("Kategoria")["Ilość"].sum().reset_index()
+        fig1 = px.pie(qty_by_cat, values='Ilość', names='Kategoria', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig1.update_traces(textinfo='value+label')
+        st.plotly_chart(fig1, use_container_width=True)
         
     with chart_col2:
-        st.subheader("Wartość kategorii (PLN)")
-        # Obliczamy wartość dla każdego produktu, a potem grupujemy
+        st.subheader("Struktura Wartości (PLN)")
         df["Wartość Pozycji"] = df["Ilość"] * df["Cena"]
-        value_data = df.groupby("Kategoria")["Wartość Pozycji"].sum()
-        st.bar_chart(value_data)
+        val_by_cat = df.groupby("Kategoria")["Wartość Pozycji"].sum().reset_index()
+        fig2 = px.pie(val_by_cat, values='Wartość Pozycji', names='Kategoria', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig2.update_traces(texttemplate='%{value:.2f} zł', textinfo='label+text')
+        st.plotly_chart(fig2, use_container_width=True)
 else:
     st.info("Dodaj produkty, aby zobaczyć statystyki.")
 
 st.divider()
 
 # --- ZAKŁADKI GŁÓWNE ---
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+# Dodano nową zakładkę w środku
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Stan Magazynowy", 
-    "Dodaj Produkt", 
+    "Dodaj Nowy Produkt", 
+    "Dostawa (Uzupełnij)",  # <--- NOWA ZAKŁADKA
     "Wysyłka", 
     "Edycja Produktu", 
     "Kategorie",
@@ -208,9 +209,10 @@ with tab1:
     if st.button("Odśwież dane"):
         st.rerun()
 
-# 2. DODAJ PRODUKT
+# 2. DODAJ NOWY PRODUKT (TWORZENIE)
 with tab2:
-    st.subheader("Przyjęcie nowego towaru")
+    st.subheader("Tworzenie nowego produktu")
+    st.info("Tutaj dodajesz produkt, którego jeszcze nie ma w bazie.")
     if not cats_list:
         st.warning("Najpierw dodaj kategorie w zakładce 'Kategorie'!")
     else:
@@ -218,7 +220,7 @@ with tab2:
             c1, c2 = st.columns(2)
             n_nazwa = c1.text_input("Nazwa")
             n_kat = c1.selectbox("Kategoria", list(mapa_kat_nazwa_id.keys()))
-            n_ilosc = c2.number_input("Ilość", 1, step=1)
+            n_ilosc = c2.number_input("Ilość początkowa", 1, step=1)
             n_cena = c2.number_input("Cena", 0.01, step=0.01)
             
             if st.form_submit_button("Dodaj do bazy"):
@@ -227,14 +229,40 @@ with tab2:
                     time.sleep(1)
                     st.rerun()
 
-# 3. WYSYŁKA
+# 3. DOSTAWA (NOWA ZAKŁADKA - UZUPEŁNIANIE)
 with tab3:
+    st.subheader("Przyjęcie dostawy (Uzupełnienie stanu)")
+    st.info("Tutaj zwiększasz ilość produktu, który już istnieje.")
+    
+    if df.empty:
+        st.info("Brak produktów w bazie.")
+    else:
+        opcje_dostawa = {f"{p['Nazwa']} (Obecnie: {p['Ilość']} szt.)": p for p in raw_data}
+        wybor_dostawa = st.selectbox("Wybierz produkt z dostawy", list(opcje_dostawa.keys()), key="dostawa_select")
+        prod_dostawa = opcje_dostawa[wybor_dostawa]
+        obecny_stan = int(prod_dostawa['Ilość'])
+        
+        with st.form("restock_form"):
+            st.write(f"Produkt: **{prod_dostawa['Nazwa']}**")
+            st.write(f"Stan przed dostawą: {obecny_stan} szt.")
+            
+            ilosc_przyjeta = st.number_input("Ile sztuk przyjechało?", min_value=1, step=1, key="ilosc_przyjeta")
+            
+            if st.form_submit_button("Zaksięguj dostawę"):
+                nowy_stan_lacznie = obecny_stan + ilosc_przyjeta
+                if aktualizuj_stan_db(prod_dostawa['ID'], prod_dostawa['Nazwa'], nowy_stan_lacznie, obecny_stan, "Dostawa"):
+                    st.success(f"Dodano {ilosc_przyjeta} szt. Nowy stan to: {nowy_stan_lacznie}.")
+                    time.sleep(1)
+                    st.rerun()
+
+# 4. WYSYŁKA
+with tab4:
     st.subheader("Wysyłka towaru")
     if df.empty:
         st.info("Brak produktów.")
     else:
         opcje = {f"{p['Nazwa']} (Dostępne: {p['Ilość']} szt.)": p for p in raw_data}
-        wybor = st.selectbox("Wybierz produkt do wysłania", list(opcje.keys()))
+        wybor = st.selectbox("Wybierz produkt do wysłania", list(opcje.keys()), key="ship_select")
         prod = opcje[wybor]
         dostepne = int(prod['Ilość'])
         
@@ -247,14 +275,13 @@ with tab3:
                     st.error(f"Błąd: Nie masz tyle towaru! Dostępne: {dostepne}.")
                 else:
                     nowy_stan = dostepne - ilosc_do_wyslania
-                    # Przekazujemy starą ilość, by wyliczyć różnicę do historii
                     if aktualizuj_stan_db(prod['ID'], prod['Nazwa'], nowy_stan, dostepne, "Wydanie"):
                         st.success(f"Wysłano {ilosc_do_wyslania} szt. Zaktualizowano stan.")
                         time.sleep(1)
                         st.rerun()
 
-# 4. EDYCJA
-with tab4:
+# 5. EDYCJA
+with tab5:
     st.subheader("Edycja danych")
     if not df.empty:
         opcje_edit = {f"{p['Nazwa']} (ID:{p['ID']})": p for p in raw_data}
@@ -272,12 +299,11 @@ with tab4:
                     domyslny_index = list(mapa_kat_nazwa_id.keys()).index(biezaca_nazwa)
             
             e_kat_nazwa = col_e1.selectbox("Kategoria", list(mapa_kat_nazwa_id.keys()), index=domyslny_index)
-            e_ilosc = col_e2.number_input("Ilość (Korekta)", min_value=0, value=int(prod_edit['Ilość']))
+            e_ilosc = col_e2.number_input("Ilość (Korekta ręczna)", min_value=0, value=int(prod_edit['Ilość']))
             e_cena = col_e2.number_input("Cena (PLN)", min_value=0.01, value=float(prod_edit['Cena']))
             
             if st.form_submit_button("Zapisz zmiany"):
                 nowe_kat_id = mapa_kat_nazwa_id[e_kat_nazwa]
-                # Przekazujemy starą nazwę do celów logowania
                 if edytuj_produkt_calosc(prod_edit['ID'], prod_edit['Nazwa'], e_nazwa, e_ilosc, e_cena, nowe_kat_id):
                     st.success("Zapisano zmiany.")
                     time.sleep(1)
@@ -291,8 +317,8 @@ with tab4:
                 time.sleep(1)
                 st.rerun()
 
-# 5. KATEGORIE
-with tab5:
+# 6. KATEGORIE
+with tab6:
     st.subheader("Kategorie")
     col_add, col_list = st.columns(2)
     
@@ -310,8 +336,6 @@ with tab5:
     with col_list:
         if cats_list:
             st.dataframe(pd.DataFrame(cats_list)[['nazwa', 'opis']], hide_index=True)
-            
-            # Prosta edycja kategorii
             st.write("Usuń kategorię:")
             k_to_del = st.selectbox("Wybierz do usunięcia", [c['nazwa'] for c in cats_list], key="del_cat_sel")
             id_to_del = mapa_kat_nazwa_id[k_to_del]
@@ -321,25 +345,23 @@ with tab5:
                     time.sleep(1)
                     st.rerun()
 
-# 6. HISTORIA (NOWA ZAKŁADKA)
-with tab6:
+# 7. HISTORIA
+with tab7:
     st.subheader("📜 Historia Operacji")
     df_hist = pobierz_historie()
     
     if not df_hist.empty:
-        # Formatowanie daty dla czytelności
         df_hist['created_at'] = pd.to_datetime(df_hist['created_at']).dt.strftime('%Y-%m-%d %H:%M')
-        
         st.dataframe(
             df_hist[['created_at', 'produkt_nazwa', 'typ_operacji', 'ilosc_zmiana']],
             column_config={
-                "created_at": "Data i Czas",
+                "created_at": "Data",
                 "produkt_nazwa": "Produkt",
-                "typ_operacji": "Operacja",
-                "ilosc_zmiana": "Zmiana ilości"
+                "typ_operacji": "Działanie",
+                "ilosc_zmiana": "Zmiana"
             },
             use_container_width=True,
             hide_index=True
         )
     else:
-        st.info("Brak historii operacji.")
+        st.info("Brak wpisów w historii.")
